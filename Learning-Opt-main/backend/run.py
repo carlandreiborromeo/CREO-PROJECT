@@ -149,6 +149,256 @@ def _copy_template_sheet_with_fallback(wb, template_ws, new_title):
                     ws.cell(row=r, column=c, value=v)
         return ws
 
+@app.route('/generate/certificates', methods=['POST'])
+def generate_certificates():
+    data = request.json
+    template_path = data.get("templatePath")
+    output_folder = "static/generated"
+    os.makedirs(output_folder, exist_ok=True)
+
+    # Get custom filename from request, or fallback
+    custom_filename = data.get("filename")
+    if custom_filename:
+        filename = f"{custom_filename}.pptx"
+    else:
+        name = data.get("name", "Certificate")
+        filename = f"{name.replace(' ', '_')}_Certificate.pptx"
+
+    output_path = os.path.join(output_folder, filename)
+
+    # Load and customize the PPTX
+    prs = Presentation(template_path)
+    for slide in prs.slides:
+        for shape in slide.shapes:
+            if shape.has_text_frame:
+                for paragraph in shape.text_frame.paragraphs:
+                    for run in paragraph.runs:
+                        if "{{" in run.text and "}}" in run.text:
+                            key = run.text.replace("{{", "").replace("}}", "").strip()
+                            run.text = data.get(key, "")
+
+    prs.save(output_path)
+
+    # Return list with one file
+    return jsonify({"files": [filename]})
+
+@app.route('/api/generate', methods=['POST'])
+def generate_tesda_excel():
+    uploaded_file = request.files.get("file")
+    if not uploaded_file:
+        return jsonify({"error": "No file uploaded"}), 400
+
+    # Save temporarily
+    temp_path = os.path.join(UPLOAD_FOLDER, f"temp_{uuid.uuid4().hex}.xlsx")
+    uploaded_file.save(temp_path)
+
+    try:
+        # Load Excel
+        wb = load_workbook(temp_path)
+        ws = wb.active
+
+        # Save to generated folder
+        now = datetime.now().strftime("%Y%m%d-%H%M%S")
+        output_filename = f"tesda_record_{now}.xlsx"
+        output_path = os.path.join(GENERATED_FOLDER, output_filename)
+        wb.save(output_path)
+
+        # ✅ Track in recent_downloads with full metadata for frontend
+        recent_downloads.insert(0, {
+            "type": "tesda",
+            "filename": output_filename,
+            "timestamp": datetime.fromtimestamp(os.path.getmtime(output_path)).strftime("%Y-%m-%d %H:%M:%S"),
+            "url": f"/static/generated/{output_filename}"
+        })
+
+        return send_file(output_path, as_attachment=True, download_name=output_filename)
+
+    finally:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+
+def api_generate_certificates():
+    import requests
+
+    # 1. Forward request to internal generator
+    response = requests.post('http://localhost:5000/generate/certificates', json=request.get_json())
+    result = response.json()
+
+    # 2. Handle error if generation failed
+    if response.status_code != 200:
+        return jsonify({"error": "Failed to generate certificates"}), 500
+
+    # 3. Get list of generated files
+    generated_files = result.get("files", [])
+
+    # 4. ✅ Track each generated file in download history
+    for fname in generated_files:
+        recent_downloads.append({
+            "type": "certificate",
+            "filename": fname,
+        })
+
+    # 5. Return original result to frontend
+    return jsonify(result)
+
+@app.route('/api/certificates', methods=['GET'])
+def get_certificates():
+    try:
+        files = [f for f in os.listdir(GENERATED_FOLDER) if f.endswith(".pptx")]
+        files.sort(key=lambda x: os.path.getmtime(os.path.join(GENERATED_FOLDER, x)), reverse=True)
+        return jsonify(files)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/tesda', methods=['GET'])
+def get_tesda_records():
+    try:
+        files = [f for f in os.listdir(GENERATED_FOLDER) if f.endswith(".xlsx")]
+        files.sort(key=lambda x: os.path.getmtime(os.path.join(GENERATED_FOLDER, x)), reverse=True)
+        return jsonify(files)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/download-history", methods=["GET"])
+def get_download_history():
+    
+    folder = os.path.join("static", "generated")
+    files = [
+        f for f in os.listdir(folder)
+        if f.endswith(".pptx") or (f.endswith(".xlsx") and "tesda" in f.lower())
+        
+    ]
+
+    # Sort by last modified time
+    files.sort(key=lambda f: os.path.getmtime(os.path.join(folder, f)), reverse=True)
+
+    history = []
+    for f in files:
+        file_type = "certificate" if f.endswith(".pptx") else "tesda"
+        history.append({
+            "type": file_type,
+            "filename": f,
+            "timestamp": datetime.fromtimestamp(os.path.getmtime(os.path.join(folder, f))).strftime("%Y-%m-%d %H:%M"),
+            "url": f"/static/generated/{f}"
+        })
+    return jsonify(history)
+
+@app.route("/api/certificates", methods=["GET"])
+def list_certificates():
+    folder = os.path.join("static", "generated")
+    if not os.path.exists(folder):
+        return jsonify([])
+
+    files = [
+        f for f in os.listdir(folder)
+        if f.endswith(".pptx") and f != "example.pptx"
+    ]
+
+    # Sort by last modified time descending
+    files.sort(key=lambda f: os.path.getmtime(os.path.join(folder, f)), reverse=True)
+
+    return jsonify(files)
+
+@app.route('/api/tesda')
+def list_tesda_files():
+    files = [
+        f for f in os.listdir("static/generated")
+        if f.endswith(".xlsx") and "TESDA" in f
+    ]
+    return jsonify(files)
+
+# TESDA GENERATION ROUTE (internal)
+@app.route('/generate/tesda', methods=['POST'])
+def generate_tesda_file():
+    try:
+        data = request.get_json()
+        template_name = data.get("template")
+        entries = data.get("data")
+
+        if not template_name or not entries:
+            return jsonify({"error": "Missing template or data"}), 400
+
+        template_path = os.path.join("uploads", "templates", template_name)
+        if not os.path.exists(template_path):
+            return jsonify({"error": "Template not found"}), 404
+
+        base_wb = load_workbook(template_path)
+        template_ws = base_wb.active
+
+        used_titles = set()
+        for idx, entry in enumerate(entries):
+            candidate_name = entry.get("Name", f"Sheet{idx+1}")
+            new_title = _safe_sheet_title(candidate_name, used_titles)
+            ws_copy = _copy_template_sheet_with_fallback(base_wb, template_ws, new_title)
+            replace_placeholders_in_worksheet(ws_copy, {}, entry)
+
+        base_wb.remove(template_ws)
+
+        filename = f"TESDA_{datetime.now().strftime('%Y-%m-%d_%H:%M')}.xlsx"
+        output_path = os.path.join("static", "generated", filename)
+        base_wb.save(output_path)
+
+        return jsonify({"files": [filename]}), 200
+
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+
+
+
+# API ROUTE THAT CALLS INTERNAL GENERATOR AND TRACKS HISTORY
+# ✅ TESDA generation route (calls internal generator and logs to history)
+@app.route('/api/generate-tesda', methods=['POST'])
+def api_generate_tesda():
+    # Forward request to the internal generator endpoint
+    response = requests.post('http://localhost:5000/generate/tesda', json=request.get_json())
+
+    if response.status_code != 200:
+        return jsonify({"error": "Failed to generate TESDA file"}), 500
+
+    result = response.json()
+    generated_files = result.get("files", [])
+
+    for fname in generated_files:
+        file_path = os.path.join("static", "generated", fname)
+        if os.path.exists(file_path):  # ✅ Only add to history if file exists
+            recent_downloads.insert(0, {
+                "type": "tesda",
+                "filename": fname,
+                "timestamp": datetime.fromtimestamp(os.path.getmtime(file_path)).strftime("%Y-%m-%d %H:%M:%S"),
+                "url": f"/static/generated/{fname}"
+            })
+
+    return jsonify(result)
+
+
+# ✅ Used by frontend to track downloads and update history
+@app.route("/api/download-history", methods=["POST"])
+def update_download_history():
+    data = request.get_json()
+    filename = data.get("filename")
+    if not filename:
+        return jsonify({"error": "Missing filename"}), 400
+
+    file_path = os.path.join("static", "generated", filename)
+    if not os.path.exists(file_path):
+        return jsonify({"error": "File does not exist"}), 404
+
+    # Avoid duplicates
+    if not any(d.get("filename") == filename for d in recent_downloads):
+        file_type = "tesda" if filename.lower().endswith(".xlsx") else "certificate"
+        recent_downloads.insert(0, {
+            "type": file_type,
+            "filename": filename,
+            "timestamp": datetime.fromtimestamp(os.path.getmtime(file_path)).strftime("%Y-%m-%d %H:%M"),
+            "url": f"/static/generated/{filename}"
+        })
+
+    return jsonify({"success": True})
+
+
 # =================== EXCEL GENERATION WITH DATABASE INTEGRATION ===================
 
 @app.route('/api/generate/excel', methods=['POST'])
@@ -161,6 +411,8 @@ def generate_excel():
             return jsonify({"error": "Request must be JSON"}), 400
             
         students = request.json.get("students", [])
+        original_filename = request.json.get("originalFileName", "")
+        
         if not students:
             return jsonify({"error": "No student data received"}), 400
 
@@ -174,23 +426,54 @@ def generate_excel():
         except Exception as e:
             return jsonify({"error": f"Failed to load Excel template: {str(e)}"}), 500
 
-        # Get file info from first student
-        first_student = students[0] if students else {}
-        immersion_date = first_student.get("date_of_immersion", "")
-        batch = str(first_student.get("batch", ""))
-        school = str(first_student.get("school", ""))
+        # Get file info from top-level request first, then fallback to first student
+        immersion_date = request.json.get("date_of_immersion", "")
+        batch = str(request.json.get("batch", ""))
+        school = str(request.json.get("school", ""))
+        
+        # If not found at top level, get from first student as fallback
+        if not immersion_date or not batch or not school:
+            first_student = students[0] if students else {}
+            if not immersion_date:
+                immersion_date = first_student.get("date_of_immersion", "")
+            if not batch:
+                batch = str(first_student.get("batch", ""))
+            if not school:
+                school = str(first_student.get("school", ""))
 
-        # Generate Excel file (existing logic)
+        # Generate Excel file
         sheet_map = {
             "PRODUCTION": wb["PRODUCTION"],
             "SUPPORT": wb["SUPPORT"],
             "TECHNICAL": wb["TECHNICAL"]
         }
 
+        # Parse and format the date properly
+        immersion_date_parsed = None
+        display_date = immersion_date
+        if immersion_date:
+            try:
+                # Handle ISO format dates (from database)
+                if 'T' in str(immersion_date):
+                    immersion_date_parsed = datetime.fromisoformat(str(immersion_date).replace('Z', '')).date()
+                    display_date = immersion_date_parsed.strftime("%Y-%m-%d")
+                # Handle standard date formats
+                elif '-' in str(immersion_date):
+                    immersion_date_parsed = datetime.strptime(str(immersion_date)[:10], "%Y-%m-%d").date()
+                    display_date = immersion_date_parsed.strftime("%Y-%m-%d")
+                elif '/' in str(immersion_date):
+                    immersion_date_parsed = datetime.strptime(str(immersion_date), "%m/%d/%Y").date()
+                    display_date = immersion_date_parsed.strftime("%Y-%m-%d")
+                else:
+                    display_date = str(immersion_date)
+            except Exception as date_error:
+                app.logger.warning(f"Date parsing error: {date_error}, using original: {immersion_date}")
+                display_date = str(immersion_date)
+
         # Fill header cells for all sheets
         for ws in wb.worksheets:
             ws['H8'] = batch + " - " + school
-            ws['H9'] = "Date of Immersion: " + immersion_date
+            ws['H9'] = "Date of Immersion: " + display_date
 
         # Fill student data
         row_counter = {"PRODUCTION": 10, "SUPPORT": 10, "TECHNICAL": 10}
@@ -247,12 +530,19 @@ def generate_excel():
 
             row_counter[dept] += 1
 
-        # Save Excel file
-        temp_dir = tempfile.mkdtemp()
+        # Save Excel file to permanent location
+        generated_dir = os.path.join("uploads", "generated")
+        os.makedirs(generated_dir, exist_ok=True)
+        
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        safe_batch = batch.replace(" ", "_") if batch else "Batch"
-        filename = f"Immersion_Grades_{safe_batch}_{timestamp}.xlsx"
-        output_path = os.path.join(temp_dir, filename)
+        if original_filename:
+            safe_filename = original_filename.replace(" ", "_")
+            filename = f"{safe_filename}_Grades_Report_{timestamp}.xlsx"
+        else:
+            safe_batch = batch.replace(" ", "_") if batch else "Batch"
+            filename = f"Immersion_Grades_{safe_batch}_{timestamp}.xlsx"
+        
+        output_path = os.path.join(generated_dir, filename)
         wb.save(output_path)
 
         # Save to database
@@ -260,7 +550,6 @@ def generate_excel():
             connection = get_db_connection()
             cursor = connection.cursor()
 
-            # Insert into generated_files table
             file_insert_query = """
             INSERT INTO generated_files (filename, original_filename, file_type, batch, school, 
                                        date_of_immersion, total_students, file_path, file_size)
@@ -268,15 +557,9 @@ def generate_excel():
             """
             
             file_size = os.path.getsize(output_path)
-            immersion_date_parsed = None
-            if immersion_date:
-                try:
-                    immersion_date_parsed = datetime.strptime(immersion_date, "%Y-%m-%d").date()
-                except:
-                    pass
 
             cursor.execute(file_insert_query, (
-                filename, filename, 'grades', batch, school,
+                filename, original_filename, 'grades', batch, school,
                 immersion_date_parsed, len(students), output_path, file_size
             ))
             
@@ -327,16 +610,18 @@ def generate_excel():
 
         except Exception as db_error:
             app.logger.error(f"Database error: {str(db_error)}")
-            # Continue with file generation even if database fails
             if connection:
                 connection.rollback()
+            return jsonify({"error": "Failed to save to database", "details": str(db_error)}), 500
 
-        return send_file(
-            output_path,
-            mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-            as_attachment=True,
-            download_name=filename
-        )
+        # Return success response with file info
+        return jsonify({
+            "message": "Excel file generated and saved successfully",
+            "filename": filename,
+            "file_id": file_id,
+            "students_processed": len(students),
+            "file_path": output_path
+        }), 200
 
     except Exception as e:
         if connection:
@@ -347,11 +632,6 @@ def generate_excel():
     finally:
         if connection:
             connection.close()
-        if temp_dir and os.path.exists(temp_dir):
-            try:
-                shutil.rmtree(temp_dir)
-            except Exception as e:
-                app.logger.error(f"Error cleaning up temp files: {str(e)}")
 
 # =================== DATABASE CRUD OPERATIONS ===================
 
@@ -444,6 +724,9 @@ def get_file_details(file_id):
 # Update file and student data
 # Replace your existing update_file function with this corrected version
 
+# Replace your existing update_file function with this corrected version
+
+# Update file and student data - CORRECTED VERSION
 @app.route('/api/generated-files/<int:file_id>', methods=['PUT'])
 def update_file(file_id):
     connection = None
@@ -481,7 +764,7 @@ def update_file(file_id):
                 file_update_values.append(immersion_date)
             except ValueError:
                 file_update_values.append(None)
-            
+                
         if file_update_fields:
             file_update_fields.append("updated_at = CURRENT_TIMESTAMP")
             file_update_query = f"UPDATE generated_files SET {', '.join(file_update_fields)} WHERE id = %s"
@@ -492,9 +775,12 @@ def update_file(file_id):
         # Update students if provided
         if students:
             updated_count = 0
+            failed_updates = []
+            
             for student in students:
                 try:
                     if 'id' in student and student['id']:  # Update existing student
+                        # Handle the 5S field properly with backticks
                         update_query = """
                         UPDATE generated_file_students SET
                             last_name = %s, first_name = %s, middle_name = %s, strand = %s,
@@ -506,56 +792,90 @@ def update_file(file_id):
                         WHERE id = %s AND file_id = %s
                         """
                         
+                        # Convert None values and ensure proper data types - FIXED VERSION
+                        def safe_convert(value, data_type='int'):
+                            if value is None or value == "" or value == "null":
+                                return None
+                            try:
+                                if isinstance(value, (int, float)):
+                                    return value
+                                if isinstance(value, str):
+                                    if value.strip() == "":
+                                        return None
+                                    if data_type == 'float':
+                                        return float(value.strip())
+                                    elif data_type == 'int':
+                                        return int(value.strip())
+                                    else:
+                                        return str(value).strip()
+                                return float(value) if data_type == 'float' else int(value)
+                            except (ValueError, TypeError):
+                                return None
+                        
                         update_values = (
-                            student.get("last_name", ""),
-                            student.get("first_name", ""),
-                            student.get("middle_name", ""),
-                            student.get("strand", ""),
-                            student.get("department", ""),
-                            to_number(student.get("over_all")),
-                            to_number(student.get("WI")),
-                            to_number(student.get("CO")),
-                            to_number(student.get("5S")),  # This might be the issue
-                            to_number(student.get("BO")),
-                            to_number(student.get("CBO")),
-                            to_number(student.get("SDG")),
-                            to_number(student.get("OHSA")),
-                            to_number(student.get("WE")),
-                            to_number(student.get("UJC")),
-                            to_number(student.get("ISO")),
-                            to_number(student.get("PO")),
-                            to_number(student.get("HR")),
-                            to_number(student.get("DS")),
-                            to_number(student.get("WI2")),
-                            to_number(student.get("ELEX")),
-                            to_number(student.get("CM")),
-                            to_number(student.get("SPC")),
-                            to_number(student.get("PROD")),
-                            to_number(student.get("PerDev")),
-                            to_number(student.get("Supp")),
-                            to_number(student.get("AppDev")),
-                            to_number(student.get("Tech")),
+                            student.get("last_name", "") or "",
+                            student.get("first_name", "") or "",
+                            student.get("middle_name", "") or "",
+                            student.get("strand", "") or "",
+                            student.get("department", "") or "",
+                            safe_convert(student.get("over_all", ""), 'float'),
+                            safe_convert(student.get("WI", ""), 'int'),
+                            safe_convert(student.get("CO", ""), 'int'),
+                            safe_convert(student.get("5S", ""), 'int'),
+                            safe_convert(student.get("BO", ""), 'int'),
+                            safe_convert(student.get("CBO", ""), 'int'),
+                            safe_convert(student.get("SDG", ""), 'int'),
+                            safe_convert(student.get("OHSA", ""), 'int'),
+                            safe_convert(student.get("WE", ""), 'int'),
+                            safe_convert(student.get("UJC", ""), 'int'),
+                            safe_convert(student.get("ISO", ""), 'int'),
+                            safe_convert(student.get("PO", ""), 'int'),
+                            safe_convert(student.get("HR", ""), 'int'),
+                            safe_convert(student.get("DS", ""), 'int'),
+                            safe_convert(student.get("WI2", ""), 'int'),
+                            safe_convert(student.get("ELEX", ""), 'int'),
+                            safe_convert(student.get("CM", ""), 'int'),
+                            safe_convert(student.get("SPC", ""), 'int'),
+                            safe_convert(student.get("PROD", ""), 'int'),
+                            safe_convert(student.get("PerDev", ""), 'int'),
+                            safe_convert(student.get("Supp", ""), 'int'),
+                            safe_convert(student.get("AppDev", ""), 'int'),
+                            safe_convert(student.get("Tech", ""), 'int'),
                             student['id'],
                             file_id
                         )
                         
+                        if not student.get('id'):
+                            app.logger.warning(f"Student missing ID: {student.get('first_name', '')} {student.get('last_name', '')}")
+                            failed_updates.append(f"Student {student.get('first_name', '')} {student.get('last_name', '')} missing ID")
+                            continue
+                        
+                        app.logger.debug(f"Updating student ID {student['id']}: over_all={student.get('over_all')}, WI={student.get('WI')}")
+                        
                         cursor.execute(update_query, update_values)
                         if cursor.rowcount > 0:
                             updated_count += 1
-                            app.logger.info(f"Updated student {student.get('first_name', '')} {student.get('last_name', '')}")
+                            app.logger.info(f"Updated student ID {student['id']}: {student.get('first_name', '')} {student.get('last_name', '')}")
                         else:
                             app.logger.warning(f"No student found with id {student['id']} for file {file_id}")
+                            failed_updates.append(f"Student ID {student['id']} not found")
                     
                     else:
                         # Handle case where student doesn't have an ID (shouldn't happen in update, but just in case)
                         app.logger.warning(f"Student without ID found in update request: {student.get('first_name', '')} {student.get('last_name', '')}")
+                        failed_updates.append(f"Student {student.get('first_name', '')} {student.get('last_name', '')} missing ID")
                         
                 except Exception as student_error:
                     app.logger.error(f"Error updating individual student {student.get('first_name', '')} {student.get('last_name', '')}: {str(student_error)}")
+                    failed_updates.append(f"Student {student.get('first_name', '')} {student.get('last_name', '')}: {str(student_error)}")
                     # Continue with other students instead of failing completely
                     continue
             
             app.logger.info(f"Successfully updated {updated_count} out of {len(students)} students")
+            
+            # If there were failed updates, include them in the response
+            if failed_updates:
+                app.logger.warning(f"Failed updates: {failed_updates}")
         
         # Log the operation
         try:
@@ -564,7 +884,8 @@ def update_file(file_id):
             VALUES (%s, %s, %s)
             """
             cursor.execute(log_query, (file_id, 'update', json.dumps({
-                'updated_students': len(students),
+                'updated_students': updated_count if 'updated_count' in locals() else 0,
+                'failed_updates': len(failed_updates) if 'failed_updates' in locals() else 0,
                 'file_metadata_updated': len(file_update_fields) > 0
             })))
         except Exception as log_error:
@@ -573,7 +894,14 @@ def update_file(file_id):
         
         connection.commit()
         app.logger.info(f"File {file_id} update completed successfully")
-        return jsonify({"message": "File updated successfully"}), 200
+        
+        response_data = {"message": "File updated successfully"}
+        if 'failed_updates' in locals() and failed_updates:
+            response_data["warnings"] = failed_updates
+            response_data["updated_count"] = updated_count
+            response_data["total_count"] = len(students)
+        
+        return jsonify(response_data), 200
         
     except mysql.connector.Error as db_error:
         if connection:
@@ -590,6 +918,25 @@ def update_file(file_id):
     finally:
         if connection:
             connection.close()
+
+
+# Also keep this helper function for consistency
+def to_number(value):
+    """Convert a value to a number, handling None and empty strings"""
+    if value is None or value == "" or value == "null":
+        return None
+    try:
+        # Try to convert to float first (for decimal values like over_all)
+        if isinstance(value, (int, float)):
+            return value
+        if isinstance(value, str):
+            if '.' in value:
+                return float(value)
+            else:
+                return int(value)
+        return float(value)
+    except (ValueError, TypeError):
+        return None
 
 # Delete file (soft delete)
 @app.route('/api/generated-files/<int:file_id>', methods=['DELETE'])
@@ -813,18 +1160,33 @@ def download_file(file_id):
             "TECHNICAL": wb["TECHNICAL"]
         }
 
-        # Fill header cells
+        # Fill header cells - Use the original date from file_info
         batch = file_info.get('batch', '')
         school = file_info.get('school', '')
         date_of_immersion = file_info.get('date_of_immersion', '')
+        
+        # Format the date properly for Excel display
         if date_of_immersion:
-            date_of_immersion = date_of_immersion.strftime("%Y-%m-%d") if hasattr(date_of_immersion, 'strftime') else str(date_of_immersion)
+            if hasattr(date_of_immersion, 'strftime'):
+                formatted_date = date_of_immersion.strftime("%Y-%m-%d")
+            else:
+                formatted_date = str(date_of_immersion)
+        else:
+            # Fallback to first student's date if file doesn't have it
+            if students and students[0].get('date_of_immersion'):
+                student_date = students[0]['date_of_immersion']
+                if hasattr(student_date, 'strftime'):
+                    formatted_date = student_date.strftime("%Y-%m-%d")
+                else:
+                    formatted_date = str(student_date)
+            else:
+                formatted_date = ""
         
         for ws in wb.worksheets:
             ws['H8'] = f"{batch} - {school}"
-            ws['H9'] = f"Date of Immersion: {date_of_immersion}"
+            ws['H9'] = f"Date of Immersion: {formatted_date}"
 
-        # Fill student data
+        # Fill student data - Use original dates from student records
         row_counter = {"PRODUCTION": 10, "SUPPORT": 10, "TECHNICAL": 10}
 
         for s in students:
@@ -839,7 +1201,7 @@ def download_file(file_id):
             ws = sheet_map[dept]
             row = row_counter[dept]
 
-            # Fill all the data (same as generate_excel)
+            # Fill all the data
             ws[f'B{row}'] = s.get("last_name", "")
             ws[f'C{row}'] = s.get("first_name", "")
             ws[f'D{row}'] = s.get("middle_name", "")
@@ -887,7 +1249,10 @@ def download_file(file_id):
         INSERT INTO file_operations_log (file_id, operation_type, operation_details)
         VALUES (%s, %s, %s)
         """
-        cursor.execute(log_query, (file_id, 'download', json.dumps({})))
+        cursor.execute(log_query, (file_id, 'download', json.dumps({
+            'date_used': formatted_date,
+            'students_count': len(students)
+        })))
         connection.commit()
         
         return send_file(
@@ -908,7 +1273,22 @@ def download_file(file_id):
                 shutil.rmtree(temp_dir)
             except Exception as e:
                 app.logger.error(f"Error cleaning up temp files: {str(e)}")
-                # Add this to the very end of your run.py file
+
+def to_number(value):
+    """Convert a value to a number, handling None and empty strings"""
+    if value is None or value == "" or value == "null":
+        return None
+    try:
+        if isinstance(value, (int, float)):
+            return value
+        if isinstance(value, str):
+            if '.' in value:
+                return float(value)
+            else:
+                return int(value)
+        return float(value)
+    except (ValueError, TypeError):
+        return None
 
 if __name__ == '__main__':
     # Configuration
@@ -953,3 +1333,5 @@ if __name__ == '__main__':
         print("   - Try a different port: set PORT=8000 && python run.py")
         print("   - Check firewall settings")
         print("   - Verify all dependencies are installed: pip install -r requirements.txt")
+
+        
